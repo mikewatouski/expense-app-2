@@ -8,6 +8,17 @@
 </head>
 <body>
   <div id="app"></div>
-  <script src="app.js"></script>
+  <!-- supabase -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script>
+  // reemplazá estas constantes con las tuyas
+  const SUPABASE_URL = 'https://aizpxebzobvfxkuatskv.supabase.co';
+  const SUPABASE_ANON_KEY = 'sb_publishable_sCWYT9VN8Cm5UEQWmOWOuA_KY0a_h39';
+
+  window.supabase = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+</script>
+
+<script src="app.js"></script>
 </body>
 </html>
+

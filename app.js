@@ -1,38 +1,217 @@
 const app = document.getElementById("app");
 
+// el script de index.html debe configurar supabase antes de cargar app.js:
+// <script>window.supabase = supabase.createClient(URL, KEY);</script>
+const sb = window.supabase;
+
 let expenseDraft = null;
 
-function getUsers() {
-  return JSON.parse(localStorage.getItem("users") || "[]");
-}
-
-function setUsers(users) {
-  localStorage.setItem("users", JSON.stringify(users));
-}
-
+// sesión almacenada localmente solo guarda el id de Supabase
 function getCurrentUser() {
   return localStorage.getItem("currentUser");
 }
-
-function setCurrentUser(username) {
-  localStorage.setItem("currentUser", username);
+function setCurrentUser(userId) {
+  localStorage.setItem("currentUser", userId);
 }
-
 function clearCurrentUser() {
   localStorage.removeItem("currentUser");
+}
+
+// helpers de base de datos ----------------------------------------------------------------
+async function getUsers() {
+  if (!sb) {
+    return JSON.parse(localStorage.getItem("users") || "[]");
+  }
+  const { data, error } = await sb.from("users").select("id,username");
+  if (error) {
+    console.error("getUsers:", error);
+    return [];
+  }
+  return data;
 }
 
 function getUserKey(key) {
   return `${getCurrentUser()}__${key}`;
 }
 
-function getData(key, fallback) {
-  const raw = localStorage.getItem(getUserKey(key));
-  return raw ? JSON.parse(raw) : fallback;
+async function getData(key, fallback) {
+  if (!sb) {
+    console.log("Supabase no disponible, usando localStorage para", key);
+    const raw = localStorage.getItem(getUserKey(key));
+    return raw ? JSON.parse(raw) : fallback;
+  }
+  console.log("Usando Supabase para getData", key);
+  const userId = getCurrentUser();
+  if (!userId) return fallback;
+
+  switch (key) {
+    case "categories": {
+      const { data, error } = await sb
+        .from("categories")
+        .select("name")
+        .eq("user_id", userId)
+        .order("created_at");
+      if (error) {
+        console.error("getData categories:", error);
+        return fallback;
+      }
+      return data.map((r) => r.name);
+    }
+    case "friends": {
+      const { data, error } = await sb
+        .from("friends")
+        .select("name")
+        .eq("user_id", userId)
+        .order("created_at");
+      if (error) {
+        console.error("getData friends:", error);
+        return fallback;
+      }
+      return data.map((r) => r.name);
+    }
+    case "expenses": {
+      const { data, error } = await sb
+        .from("expenses")
+        .select(`
+          id,
+          date_time,
+          total_amount,
+          category:categories(name),
+          shared_expenses (
+            friend_id,
+            amount,
+            paid
+          )
+        `)
+        .eq("user_id", userId);
+      if (error) {
+        console.error("getData expenses:", error);
+        return fallback;
+      }
+      const { data: friendRows } = await sb
+        .from("friends")
+        .select("id,name")
+        .eq("user_id", userId);
+      const friendsMap = {};
+      if (friendRows) {
+        friendRows.forEach((r) => (friendsMap[r.id] = r.name));
+      }
+      return data.map((e) => ({
+        id: e.id,
+        dateTime: e.date_time,
+        category: e.category ? e.category.name : "",
+        totalAmount: Number(e.total_amount),
+        shares: (e.shared_expenses || []).map((se) => ({
+          friend: friendsMap[se.friend_id] || "",
+          amount: Number(se.amount),
+          paid: se.paid,
+        })),
+      }));
+    }
+    default:
+      return fallback;
+  }
 }
 
-function setData(key, value) {
-  localStorage.setItem(getUserKey(key), JSON.stringify(value));
+async function setData(key, value) {
+  if (!sb) {
+    console.log("Supabase no disponible, usando localStorage para", key);
+    localStorage.setItem(getUserKey(key), JSON.stringify(value));
+    return;
+  }
+  console.log("Usando Supabase para setData", key);
+  const userId = getCurrentUser();
+  if (!userId) return;
+
+  switch (key) {
+    case "categories": {
+      await sb.from("categories").delete().eq("user_id", userId);
+      if (value.length) {
+        await sb.from("categories").insert(
+          value.map((name) => ({ user_id: userId, name }))
+        );
+      }
+      break;
+    }
+    case "friends": {
+      await sb.from("friends").delete().eq("user_id", userId);
+      if (value.length) {
+        await sb.from("friends").insert(
+          value.map((name) => ({ user_id: userId, name }))
+        );
+      }
+      break;
+    }
+    case "expenses": {
+      // Get current expense ids
+      const { data: currentExpenses } = await sb
+        .from("expenses")
+        .select("id")
+        .eq("user_id", userId);
+      const currentIds = currentExpenses ? currentExpenses.map(e => e.id) : [];
+      // Delete shared_expenses for existing expenses
+      if (currentIds.length) {
+        await sb.from("shared_expenses").delete().in("expense_id", currentIds);
+      }
+      // Delete all expenses
+      await sb.from("expenses").delete().eq("user_id", userId);
+      // Reinsert
+      for (const exp of value) {
+        let { data: catRow } = await sb
+          .from("categories")
+          .select("id")
+          .eq("user_id", userId)
+          .eq("name", exp.category)
+          .single();
+        let catId = catRow ? catRow.id : null;
+        if (!catId) {
+          const { data: newCat } = await sb
+            .from("categories")
+            .insert({ user_id: userId, name: exp.category })
+            .select("id")
+            .single();
+          catId = newCat.id;
+        }
+        const { data: inserted } = await sb
+          .from("expenses")
+          .insert({
+            user_id: userId,
+            date_time: exp.dateTime,
+            total_amount: exp.totalAmount,
+            category_id: catId,
+          })
+          .select("id")
+          .single();
+        exp.id = inserted.id; // Update the id in the array
+        if (exp.shares && exp.shares.length) {
+          for (const s of exp.shares) {
+            let { data: friendRow } = await sb
+              .from("friends")
+              .select("id")
+              .eq("user_id", userId)
+              .eq("name", s.friend)
+              .single();
+            let friendId = friendRow ? friendRow.id : null;
+            if (!friendId) {
+              const { data: newFriend } = await sb
+                .from("friends")
+                .insert({ user_id: userId, name: s.friend })
+                .select("id")
+                .single();
+              friendId = newFriend.id;
+            }
+            await sb.from("shared_expenses").insert({
+              expense_id: inserted.id,
+              friend_id: friendId,
+              amount: s.amount,
+              paid: s.paid,
+            });
+          }
+        }
+      }
+      break;
+    }
+  }
 }
 
 function nowLocalInputValue() {
@@ -65,24 +244,25 @@ function showScreen(html) {
   app.innerHTML = `<div class="screen">${html}</div>`;
 }
 
-function initUserData(username) {
-  const categoriesKey = `${username}__categories`;
-  const expensesKey = `${username}__expenses`;
-  const friendsKey = `${username}__friends`;
-
-  if (!localStorage.getItem(categoriesKey)) {
-    localStorage.setItem(
-      categoriesKey,
-      JSON.stringify(["Comida", "Transporte", "Salidas", "Compras", "Otros"])
-    );
+async function initUserData(userId) {
+  // crea filas iniciales si aún no existen
+  const cats = await getData("categories", []);
+  if (cats.length === 0) {
+    await setData("categories", [
+      "Comida",
+      "Transporte",
+      "Salidas",
+      "Compras",
+      "Otros",
+    ]);
   }
-
-  if (!localStorage.getItem(expensesKey)) {
-    localStorage.setItem(expensesKey, JSON.stringify([]));
+  const exps = await getData("expenses", []);
+  if (exps.length === 0) {
+    await setData("expenses", []);
   }
-
-  if (!localStorage.getItem(friendsKey)) {
-    localStorage.setItem(friendsKey, JSON.stringify([]));
+  const frs = await getData("friends", []);
+  if (frs.length === 0) {
+    await setData("friends", []);
   }
 }
 
@@ -165,7 +345,7 @@ function renderRegister() {
   `);
 }
 
-function handleRegister() {
+async function handleRegister() {
   const username = document.getElementById("register-username").value.trim();
   const password = document.getElementById("register-password").value.trim();
   const error = document.getElementById("register-error");
@@ -177,30 +357,42 @@ function handleRegister() {
     return;
   }
 
-  const users = getUsers();
+  // Check if username exists
+  const { data: existing, error: err1 } = await sb
+    .from('users')
+    .select('id')
+    .eq('username', username)
+    .single();
 
-  const sameUsername = users.find(
-    (u) => u.username.toLowerCase() === username.toLowerCase()
-  );
-  if (sameUsername) {
+  if (err1 && err1.code !== 'PGRST116') { // PGRST116 = not found
+    console.error(err1);
+    error.textContent = "Error de base de datos.";
+    return;
+  }
+  if (existing) {
     error.textContent = "Ese nombre de usuario ya existe.";
     return;
   }
 
-  const samePassword = users.find((u) => u.password === password);
-  if (samePassword) {
-    error.textContent = "Esa contraseña ya está en uso.";
+  // Insert new user
+  const { data: user, error: err2 } = await sb
+    .from('users')
+    .insert({ username, password_hash: password })
+    .select('id')
+    .single();
+
+  if (err2) {
+    console.error(err2);
+    error.textContent = "No se pudo crear la cuenta.";
     return;
   }
 
-  users.push({ username, password });
-  setUsers(users);
-  setCurrentUser(username);
-  initUserData(username);
+  setCurrentUser(user.id);
+  await initUserData(user.id);
   renderHome();
 }
 
-function handleLogin() {
+async function handleLogin() {
   const username = document.getElementById("login-username").value.trim();
   const password = document.getElementById("login-password").value.trim();
   const error = document.getElementById("login-error");
@@ -212,23 +404,24 @@ function handleLogin() {
     return;
   }
 
-  const users = getUsers();
-  const user = users.find(
-    (u) => u.username.toLowerCase() === username.toLowerCase()
-  );
+  const { data: user, error: err } = await sb
+    .from('users')
+    .select('id, password_hash')
+    .eq('username', username)
+    .single();
 
-  if (!user) {
+  if (err || !user) {
     error.textContent = "Ese usuario no existe.";
     return;
   }
 
-  if (user.password !== password) {
+  if (user.password_hash !== password) {
     error.textContent = "Contraseña incorrecta.";
     return;
   }
 
-  setCurrentUser(user.username);
-  initUserData(user.username);
+  setCurrentUser(user.id);
+  await initUserData(user.id);
   renderHome();
 }
 
@@ -254,8 +447,8 @@ function renderHome() {
 
     <div class="vertical-actions">
       <button class="btn btn-primary" onclick="startExpenseFlow()">Registrar gasto</button>
-      <button class="btn btn-secondary" onclick="renderSummary()">Ver resumen semanal / mensual / gastos compartidos</button>
-      <button class="btn btn-dark" onclick="renderManageCategories()">Gestionar categorías</button>
+      <button class="btn btn-secondary" onclick="(async () => { await renderSummary(); })()">Ver resumen semanal / mensual / gastos compartidos</button>
+      <button class="btn btn-dark" onclick="(async () => { await renderManageCategories(); })()">Gestionar categorías</button>
       <button class="btn btn-danger" onclick="logout()">Cerrar sesión</button>
     </div>
   `);
@@ -270,8 +463,8 @@ function logout() {
    CATEGORIES
 ========================= */
 
-function renderManageCategories() {
-  const categories = getData("categories", []);
+async function renderManageCategories() {
+  const categories = await getData("categories", []);
 
   showScreen(`
     <div class="topbar">
@@ -285,7 +478,7 @@ function renderManageCategories() {
     <div class="section">
       <label>Nueva categoría</label>
       <input class="input" id="new-category-name" placeholder="Ej: Merienda, Universidad, Regalos..." />
-      <button class="btn btn-primary" onclick="addCategory()">Agregar categoría</button>
+      <button class="btn btn-primary" onclick="(async () => { await addCategory(); })()">Agregar categoría</button>
       <div id="category-msg" class="error"></div>
     </div>
 
@@ -300,8 +493,8 @@ function renderManageCategories() {
                     <div class="category-row">
                       <div class="category-name">${escapeHtml(cat)}</div>
                       <div class="inline-actions">
-                        <button class="mini-btn mini-edit" onclick="renameCategory(${index})">Editar</button>
-                        <button class="mini-btn mini-delete" onclick="deleteCategory(${index})">Eliminar</button>
+                        <button class="mini-btn mini-edit" onclick="(async () => { await renameCategory(${index}); })()">Editar</button>
+                        <button class="mini-btn mini-delete" onclick="(async () => { await deleteCategory(${index}); })()">Eliminar</button>
                       </div>
                     </div>
                   `
@@ -316,7 +509,7 @@ function renderManageCategories() {
   `);
 }
 
-function addCategory() {
+async function addCategory() {
   const input = document.getElementById("new-category-name");
   const msg = document.getElementById("category-msg");
   const value = input.value.trim();
@@ -328,7 +521,7 @@ function addCategory() {
     return;
   }
 
-  const categories = getData("categories", []);
+  const categories = await getData("categories", []);
   const exists = categories.find((c) => c.toLowerCase() === value.toLowerCase());
 
   if (exists) {
@@ -337,12 +530,12 @@ function addCategory() {
   }
 
   categories.push(value);
-  setData("categories", categories);
-  renderManageCategories();
+  await setData("categories", categories);
+  await renderManageCategories();
 }
 
-function renameCategory(index) {
-  const categories = getData("categories", []);
+async function renameCategory(index) {
+  const categories = await getData("categories", []);
   const current = categories[index];
   const next = prompt("Nuevo nombre para la categoría:", current);
 
@@ -360,7 +553,7 @@ function renameCategory(index) {
     return;
   }
 
-  const expenses = getData("expenses", []);
+  const expenses = await getData("expenses", []);
   expenses.forEach((expense) => {
     if (expense.category === current) {
       expense.category = clean;
@@ -368,13 +561,13 @@ function renameCategory(index) {
   });
 
   categories[index] = clean;
-  setData("categories", categories);
-  setData("expenses", expenses);
-  renderManageCategories();
+  await setData("categories", categories);
+  await setData("expenses", expenses);
+  await renderManageCategories();
 }
 
-function deleteCategory(index) {
-  const categories = getData("categories", []);
+async function deleteCategory(index) {
+  const categories = await getData("categories", []);
   const current = categories[index];
 
   const ok = confirm(
@@ -389,16 +582,16 @@ function deleteCategory(index) {
     categories.push("Otros");
   }
 
-  const expenses = getData("expenses", []);
+  const expenses = await getData("expenses", []);
   expenses.forEach((expense) => {
     if (expense.category === current) {
       expense.category = "Otros";
     }
   });
 
-  setData("categories", categories);
-  setData("expenses", expenses);
-  renderManageCategories();
+  await setData("categories", categories);
+  await setData("expenses", expenses);
+  await renderManageCategories();
 }
 
 /* =========================
@@ -450,21 +643,21 @@ function renderExpenseStep1() {
     </div>
 
     <div class="row">
-      <button class="btn btn-primary" onclick="goExpenseStep2()">Siguiente</button>
+      <button class="btn btn-primary" onclick="(async () => { await goExpenseStep2(); })()">Siguiente</button>
       <button class="btn btn-dark" onclick="renderHome()">Cancelar</button>
     </div>
   `);
 }
 
-function goExpenseStep2() {
+async function goExpenseStep2() {
   const value = document.getElementById("expense-datetime").value;
   if (!value) return;
   expenseDraft.dateTime = value;
-  renderExpenseStep2();
+  await renderExpenseStep2();
 }
 
-function renderExpenseStep2() {
-  const categories = getData("categories", []);
+async function renderExpenseStep2() {
+  const categories = await getData("categories", []);
 
   showScreen(`
     <div class="topbar">
@@ -492,10 +685,10 @@ function renderExpenseStep2() {
 
       <label>Crear una categoría nueva</label>
       <input class="input" id="quick-new-category" placeholder="Ej: Facultad, Delivery, Regalo..." />
-      <button class="btn btn-secondary" onclick="quickAddCategory()">Agregar categoría</button>
+      <button class="btn btn-secondary" onclick="(async () => { await quickAddCategory(); })()">Agregar categoría</button>
 
       <div class="helper">
-        Si querés modificar o borrar categorías, hacelo desde <span class="small-link" onclick="renderManageCategories()">Gestionar categorías</span>.
+        Si querés modificar o borrar categorías, hacelo desde <span class="small-link" onclick="(async () => { await renderManageCategories(); })()">Gestionar categorías</span>.
       </div>
     </div>
 
@@ -506,12 +699,12 @@ function renderExpenseStep2() {
   `);
 }
 
-function quickAddCategory() {
+async function quickAddCategory() {
   const input = document.getElementById("quick-new-category");
   const value = input.value.trim();
   if (!value) return;
 
-  const categories = getData("categories", []);
+  const categories = await getData("categories", []);
   const exists = categories.find((c) => c.toLowerCase() === value.toLowerCase());
 
   if (exists) {
@@ -520,9 +713,9 @@ function quickAddCategory() {
   }
 
   categories.push(value);
-  setData("categories", categories);
+  await setData("categories", categories);
   expenseDraft.category = value;
-  renderExpenseStep2();
+  await renderExpenseStep2();
 }
 
 function goExpenseStep3() {
@@ -580,7 +773,7 @@ function renderExpenseStep3() {
             </div>
 
             <button class="btn btn-secondary" onclick="resetAmountSelection()">Cambiar monto</button>
-            <button class="btn btn-primary" onclick="goExpenseStep4()">Siguiente</button>
+            <button class="btn btn-primary" onclick="(async () => { await goExpenseStep4(); })()">Siguiente</button>
           `
           : `
             <div class="amount-grid">
@@ -623,8 +816,8 @@ function resetAmountSelection() {
   renderExpenseStep3();
 }
 
-function renderExpenseStep4() {
-  const friends = getData("friends", []);
+async function renderExpenseStep4() {
+  const friends = await getData("friends", []);
   const currentShares = expenseDraft.shares || [];
 
   showScreen(`
@@ -714,7 +907,7 @@ function renderExpenseStep4() {
 
             <label>Agregar amigo</label>
             <input class="input" id="new-friend-name" placeholder="Nombre del amigo" />
-            <button class="btn btn-secondary" onclick="addFriendFromExpense()">Agregar amigo</button>
+            <button class="btn btn-secondary" onclick="(async () => { await addFriendFromExpense(); })()">Agregar amigo</button>
 
             <div class="helper">
               Tus amigos no tienen cuenta propia. Son solo para que vos veas quién te debe plata.
@@ -734,7 +927,7 @@ function renderExpenseStep4() {
     </div>
 
     <div class="row">
-      <button class="btn btn-success" onclick="saveExpense()">Guardar gasto en la nube</button>
+      <button class="btn btn-success" onclick="(async () => { await saveExpense(); })()">Guardar gasto en la nube</button>
       <button class="btn btn-dark" onclick="renderExpenseStep3()">Atrás</button>
     </div>
   `);
@@ -770,12 +963,12 @@ function setFriendShareAmount(friend, value) {
   share.amount = Number(value);
 }
 
-function addFriendFromExpense() {
+async function addFriendFromExpense() {
   const input = document.getElementById("new-friend-name");
   const value = input.value.trim();
   if (!value) return;
 
-  const friends = getData("friends", []);
+  const friends = await getData("friends", []);
   const exists = friends.find((f) => f.toLowerCase() === value.toLowerCase());
 
   if (exists) {
@@ -784,19 +977,19 @@ function addFriendFromExpense() {
   }
 
   friends.push(value);
-  setData("friends", friends);
+  await setData("friends", friends);
 
   if (!expenseDraft.shares) expenseDraft.shares = [];
   expenseDraft.shares.push({ friend: value, amount: "", paid: false });
 
-  renderExpenseStep4();
+  await renderExpenseStep4();
 }
 
-function goExpenseStep4() {
-  renderExpenseStep4();
+async function goExpenseStep4() {
+  await renderExpenseStep4();
 }
 
-function saveExpense() {
+async function saveExpense() {
   if (!expenseDraft.dateTime || !expenseDraft.category || !expenseDraft.totalAmount) {
     alert("Faltan datos del gasto.");
     return;
@@ -823,7 +1016,7 @@ function saveExpense() {
     }
   }
 
-  const expenses = getData("expenses", []);
+  const expenses = await getData("expenses", []);
   expenses.push({
     id: Date.now(),
     dateTime: expenseDraft.dateTime,
@@ -832,7 +1025,7 @@ function saveExpense() {
     shares
   });
 
-  setData("expenses", expenses);
+  await setData("expenses", expenses);
   expenseDraft = null;
   renderHome();
 }
@@ -849,8 +1042,8 @@ function getRealSpent(expense) {
   return Number(expense.totalAmount) - paidBack;
 }
 
-function renderSummary() {
-  const expenses = getData("expenses", []);
+async function renderSummary() {
+  const expenses = await getData("expenses", []);
   const now = new Date();
 
   const currentMonth = now.getMonth();
@@ -955,7 +1148,7 @@ function renderSummary() {
                         Te debe plata por <strong>${escapeHtml(share.category)}</strong> · ${formatDateTime(share.dateTime)}
                       </div>
                       <div style="margin-top:10px;">
-                        <button class="btn btn-success" onclick="markSharePaid(${share.expenseId}, '${escapeJs(share.friend)}')">
+                        <button class="btn btn-success" onclick="(async () => { await markSharePaid('${share.expenseId}', '${escapeJs(share.friend)}'); })()">
                           Marcar como pagado
                         </button>
                       </div>
@@ -972,8 +1165,8 @@ function renderSummary() {
   `);
 }
 
-function markSharePaid(expenseId, friend) {
-  const expenses = getData("expenses", []);
+async function markSharePaid(expenseId, friend) {
+  const expenses = await getData("expenses", []);
   const expense = expenses.find((e) => e.id === expenseId);
   if (!expense) return;
 
@@ -981,8 +1174,8 @@ function markSharePaid(expenseId, friend) {
   if (!share) return;
 
   share.paid = true;
-  setData("expenses", expenses);
-  renderSummary();
+  await setData("expenses", expenses);
+  await renderSummary();
 }
 
 /* =========================
@@ -1010,10 +1203,10 @@ function escapeJs(value) {
    START
 ========================= */
 
-(function startApp() {
+(async function startApp() {
   const user = getCurrentUser();
   if (user) {
-    initUserData(user);
+    await initUserData(user);
     renderHome();
   } else {
     renderAuthChoice();
