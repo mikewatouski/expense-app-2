@@ -10,11 +10,18 @@ let expenseDraft = null;
 function getCurrentUser() {
   return localStorage.getItem("currentUser");
 }
-function setCurrentUser(userId) {
+function setCurrentUser(userId, username) {
   localStorage.setItem("currentUser", userId);
+  localStorage.setItem("currentUsername", username);
 }
+
+function getCurrentUsername() {
+  return localStorage.getItem("currentUsername");
+}
+
 function clearCurrentUser() {
   localStorage.removeItem("currentUser");
+  localStorage.removeItem("currentUsername");
 }
 
 // helpers de base de datos ----------------------------------------------------------------
@@ -387,7 +394,7 @@ async function handleRegister() {
     return;
   }
 
-  setCurrentUser(user.id);
+  setCurrentUser(user.id, username);
   await initUserData(user.id);
   renderHome();
 }
@@ -420,7 +427,7 @@ async function handleLogin() {
     return;
   }
 
-  setCurrentUser(user.id);
+  setCurrentUser(user.id, username);
   await initUserData(user.id);
   renderHome();
 }
@@ -430,7 +437,7 @@ async function handleLogin() {
 ========================= */
 
 function renderHome() {
-  const username = getCurrentUser();
+  const username = getCurrentUsername() || "Usuario";
 
   showScreen(`
     <div class="topbar">
